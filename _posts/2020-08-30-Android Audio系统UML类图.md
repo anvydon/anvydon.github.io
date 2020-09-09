@@ -10,4 +10,4 @@ tags:
     - Audio
 ---
 
-![adfa](img/AudioFlinger.png)
+![adfa](../img/AudioFlinger.png)
