@@ -1,0 +1,1163 @@
+---
+layout:     post
+title:      Android Audio系统类图
+subtitle:   Android Audio系统类图
+date:       2020-08-30
+author:     Joey
+header-img: img/post-bg-debug.png
+catalog: true
+tags:
+    - Audio
+---
+
+# Android 音频策略配置文件(audio_policy_configuration.xml)解析
+
+## 介绍
+Android 10版本对音频策略管理进行了重大重构, 有助于更灵活地支持复杂的车载使用情形：
+
+*  提供了 OEM 专用路由策略。
+* 针对使用相同音量曲线的旧版音频流类型组提供了可自定义音量组。
+* 路由策略由音频政策引擎声明，而不是采用硬编码格式。
+* 音量曲线和组由音频政策引擎管理。
+* 进行了内部重构，目的是为将来分离公共代码和可配置代码做准备，并提供更丰富的音频设备管理功能。例如，在策略规则中使用所有设备属性，而不仅仅是其类型。
+
+## XML对比CONF
+* CONF 是一种简单的专有格式，有较大的局限性，无法描述电视和汽车等行业的复杂拓扑。
+* XML文件格式更易于阅读，可使用各种修改和解析工具，并且足够灵活，可以描述复杂的音频拓扑。
+* 与在 CONF 文件中一样，XML 文件支持定义输出输入流配置文件、可用于播放和捕获的设备以及音频属性的数量和类型。
+* 在 Android 10 中，允许同时使用多个正在运行的录音应用。
+* 音频配置文件的结构类似于 HDMI 简单音频描述符，支持每种音频格式使用一组不同的采样率/声道掩码。
+* 设备和流之间所有可能的连接都有显式定义。以前，隐式规则可以使连接到同一 HAL 模块的所有设备互连，从而阻止音频政策控制使用音频补丁程序 API 请求的连接。在 XML 格式中，拓扑描述定义了连接限制。
+* 对“包含”的支持可避免出现重复的标准 A2DP、USB 或重新导向提交定义。
+* 音量曲线可自定义。以前，音量表采用硬编码格式。在 XML 格式中，音量表通过描述来定义，并且可自定义。
+
+## 音频策略代码结构
+平台将 AudioPolicyManager.cpp 拆分为多个模块，使其易于维护和配置。frameworks/av/services/audiopolicy 的组织包括以下模块：
+
+|模块|说明|
+| --- | --- |
+|/managerdefault|包含所有应用通用的常规接口和行为实现。类似于剥离了引擎功能和通用概念的 AudioPolicyManager.cpp。|
+|/common|定义基类（例如，输入输出音频流配置文件、音频设备描述符、音频补丁程序和音频端口等的数据结构）。该模块之前在 AudioPolicyManager.cpp 中定义。|
+|/engine|实现规则，这些规则定义应将哪些设备和音量用于指定使用情形。该模块会实现标准接口（包含通用部分），例如，为指定的播放或捕获使用情形获取适当的设备，或设置可以改变导向选择的已连接设备或外部状态（即强制使用的调用状态）。两种版本（自定义版本和默认版本）中都提供该模块；使用编译选项 USE_CONFIGURABLE_AUDIO_POLICY 进行选择。|
+|/engineconfigurable|依赖参数框架的政策引擎实现（请参阅下文）。配置基于参数框架，相关政策由 XML 文件定义。|
+|/enginedefault|基于以前的 Android 音频政策管理器实现的政策引擎实现。这是默认模块，包含 Nexus 和 AOSP 实现对应的硬编码规则。|
+|/service|包含 Binder 接口、线程和锁定实现（包含连接框架其余部分的接口）。|
+
+## audio_policy_configuration.xml文件解析
+代码中路径:
+`frameworks/av/services/audiopolicy/config/audio_policy_configuration.xml`
+
+设备中路径:
+`/system/etc/`
+
+* 音频策略文件解析在`AudioPolicyManager.cpp`构造函数中`loadConfig();`
+```
+AudioPolicyManager::AudioPolicyManager(AudioPolicyClientInterface *clientInterface)
+        : AudioPolicyManager(clientInterface, false /*forTesting*/)
+{
+    loadConfig();
+    initialize();
+}
+```
+
+* 由`USE_XML_AUDIO_POLICY_CONF`宏控制`deserializeAudioPolicyXmlConfig`
+```
+void AudioPolicyManager::loadConfig() {
+#ifdef USE_XML_AUDIO_POLICY_CONF
+    if (deserializeAudioPolicyXmlConfig(getConfig()) != NO_ERROR) {
+#else
+    if ((ConfigParsingUtils::loadConfig(AUDIO_POLICY_VENDOR_CONFIG_FILE, getConfig()) != NO_ERROR)
+           && (ConfigParsingUtils::loadConfig(AUDIO_POLICY_CONFIG_FILE, getConfig()) != NO_ERROR)) {
+#endif
+        ALOGE("could not load audio policy configuration file, setting defaults");
+        getConfig().setDefault();
+    }
+}
+```
+
+* 遍历xml文件列表, 通过 PolicySerializer 类实现解析，解析入口函数为 deserialize
+`\frameworks\av\services\audiopolicy\common\managerdefinitions\include\Serializer.h`
+`\frameworks\av\services\audiopolicy\common\managerdefinitions\src\Serializer.cpp`
+```
+static status_t deserializeAudioPolicyXmlConfig(AudioPolicyConfig &config) {
+    char audioPolicyXmlConfigFile[AUDIO_POLICY_XML_CONFIG_FILE_PATH_MAX_LENGTH];
+    std::vector<const char*> fileNames;
+    status_t ret;
+
+    if (property_get_bool("ro.bluetooth.a2dp_offload.supported", false) &&
+        property_get_bool("persist.bluetooth.a2dp_offload.disabled", false)) {
+        // A2DP offload supported but disabled: try to use special XML file
+        fileNames.push_back(AUDIO_POLICY_A2DP_OFFLOAD_DISABLED_XML_CONFIG_FILE_NAME);
+    }
+    fileNames.push_back(AUDIO_POLICY_XML_CONFIG_FILE_NAME);
+
+    for (const char* fileName : fileNames) {
+        for (int i = 0; i < kConfigLocationListSize; i++) {
+            PolicySerializer serializer;
+            snprintf(audioPolicyXmlConfigFile, sizeof(audioPolicyXmlConfigFile),
+                     "%s/%s", kConfigLocationList[i], fileName);
+            ret = serializer.deserialize(audioPolicyXmlConfigFile, config);
+            if (ret == NO_ERROR) {
+                return ret;
+            }
+        }
+    }
+    return ret;
+}
+```
+
+* PolicySerializer构造函数初始化变量:
+mVersion="1.0"
+mRootElementName="audioPolicyConfiguration"
+
+```
+const char *const PolicySerializer::rootName = "audioPolicyConfiguration";
+const uint32_t PolicySerializer::gMajor = 1;
+const uint32_t PolicySerializer::gMinor = 0;
+
+PolicySerializer::PolicySerializer() : mRootElementName(rootName)
+{
+    std::ostringstream oss;
+    oss << gMajor << "." << gMinor;
+    mVersion = oss.str();
+    ALOGV("%s: Version=%s Root=%s", __FUNCTION__, mVersion.c_str(), mRootElementName.c_str());
+}
+```
+* deserialize函数
+configFile:
+`#define AUDIO_POLICY_XML_CONFIG_FILE "/system/etc/audio_policy_configuration.xml"`
+config:
+AudioPolicyConfig对象, 封装整个xml数据结构
+`\frameworks\av\services\audiopolicy\common\managerdefinitions\include\AudioPolicyConfig.h`
+
+```
+status_t PolicySerializer::deserialize(const char *configFile, AudioPolicyConfig &config)
+{
+    xmlDocPtr doc;
+    doc = xmlParseFile(configFile); //读取xml文件
+    if (doc == NULL) {
+        ALOGE("%s: Could not parse %s document.", __FUNCTION__, configFile);
+        return BAD_VALUE;
+    }
+    xmlNodePtr cur = xmlDocGetRootElement(doc); //获取根节点
+    if (cur == NULL) {
+        ALOGE("%s: Could not parse %s document: empty.", __FUNCTION__, configFile);
+        xmlFreeDoc(doc);
+        return BAD_VALUE;
+    }
+    if (xmlXIncludeProcess(doc) < 0) {
+         ALOGE("%s: libxml failed to resolve XIncludes on %s document.", __FUNCTION__, configFile);
+    }
+
+    if (xmlStrcmp(cur->name, (const xmlChar *) mRootElementName.c_str()))  { //读取根节点名跟mRootElementName匹配
+        ALOGE("%s: No %s root element found in xml data %s.", __FUNCTION__, mRootElementName.c_str(),
+              (const char *)cur->name);
+        xmlFreeDoc(doc);
+        return BAD_VALUE;
+    }
+
+    string version = getXmlAttribute(cur, versionAttribute); //读取版本属性值跟mVersion匹配
+    if (version.empty()) {
+        ALOGE("%s: No version found in root node %s", __FUNCTION__, mRootElementName.c_str());
+        return BAD_VALUE;
+    }
+    if (version != mVersion) {
+        ALOGE("%s: Version does not match; expect %s got %s", __FUNCTION__, mVersion.c_str(),
+              version.c_str());
+        return BAD_VALUE;
+    }
+    // Lets deserialize children
+    // Modules
+    ModuleTraits::Collection modules;
+    deserializeCollection<ModuleTraits>(doc, cur, modules, &config);
+    config.setHwModules(modules);
+
+    // deserialize volume section
+    VolumeTraits::Collection volumes;
+    deserializeCollection<VolumeTraits>(doc, cur, volumes, &config);
+    config.setVolumes(volumes);
+
+    // Global Configuration
+    GlobalConfigTraits::deserialize(cur, config);
+
+    xmlFreeDoc(doc);
+    return android::OK;
+}
+```
+* AudioPolicyConfig封装整个音频策略数据结构, 属性如下
+```
+class AudioPolicyConfig
+{
+public:
+    AudioPolicyConfig(HwModuleCollection &hwModules,
+                      DeviceVector &availableOutputDevices,
+                      DeviceVector &availableInputDevices,
+                      sp<DeviceDescriptor> &defaultOutputDevices,
+                      VolumeCurvesCollection *volumes = nullptr)
+        : mHwModules(hwModules),
+          mAvailableOutputDevices(availableOutputDevices),
+          mAvailableInputDevices(availableInputDevices),
+          mDefaultOutputDevices(defaultOutputDevices),
+          mVolumeCurves(volumes),
+          mIsSpeakerDrcEnabled(false)
+    {}
+    
+	...
+	
+private:
+    HwModuleCollection &mHwModules; /**< Collection of Module, with Profiles, i.e. Mix Ports. */ //xml中module模块的集合
+    DeviceVector &mAvailableOutputDevices; // xm中所以output devices模块集合
+    DeviceVector &mAvailableInputDevices; //xml中所以input devices模块集合
+    sp<DeviceDescriptor> &mDefaultOutputDevices; //默认的output device
+    VolumeCurvesCollection *mVolumeCurves; //所以音量曲线集合
+    // TODO: remove when legacy conf file is removed. true on devices that use DRC on the
+    // DEVICE_CATEGORY_SPEAKER path to boost soft sounds, used to adjust volume curves accordingly.
+    // Note: remove also speaker_drc_enabled from global configuration of XML config file.
+    bool mIsSpeakerDrcEnabled; //是否支持speaker drc
+};
+```
+
+* 解析modules, 设置到config对象中.
+```
+    ModuleTraits::Collection modules;
+    deserializeCollection<ModuleTraits>(doc, cur, modules, &config);
+    config.setHwModules(modules);
+```
+```
+struct ModuleTraits
+{
+    static const char *const tag;
+    static const char *const collectionTag;
+
+    static const char *const childAttachedDevicesTag;
+    static const char *const childAttachedDeviceTag;
+    static const char *const childDefaultOutputDeviceTag;
+
+    struct Attributes
+    {
+        static const char name[];
+        static const char version[];
+    };
+
+    typedef HwModule Element;
+    typedef sp<Element> PtrElement;
+    typedef HwModuleCollection Collection;
+    typedef AudioPolicyConfig *PtrSerializingCtx;
+
+    static status_t deserialize(_xmlDoc *doc, const _xmlNode *root, PtrElement &element,
+                                PtrSerializingCtx serializingContext);
+
+    // Children are: mixPortTraits, devicePortTraits and routeTraits
+    // Need to call deserialize on each child
+};
+```
+
+* deserializeCollection模板函数
+doc xml句柄
+cur当前节点
+collection 对应Trait::Collection对象
+serializingContext 对应的audiopolicyconfig对象
+通过while循环遍历子节点,对比 collectionTag tag值, 调用对应模板类的deserialize函数.
+```
+template <class Trait>
+static status_t deserializeCollection(_xmlDoc *doc, const _xmlNode *cur,
+                                      typename Trait::Collection &collection,
+                                      typename Trait::PtrSerializingCtx serializingContext)
+{
+    const xmlNode *root = cur->xmlChildrenNode;
+    while (root != NULL) {
+        if (xmlStrcmp(root->name, (const xmlChar *)Trait::collectionTag) &&
+                xmlStrcmp(root->name, (const xmlChar *)Trait::tag)) {
+            root = root->next;
+            continue;
+        }
+        const xmlNode *child = root;
+        if (!xmlStrcmp(child->name, (const xmlChar *)Trait::collectionTag)) {
+            child = child->xmlChildrenNode;
+        }
+        while (child != NULL) {
+            if (!xmlStrcmp(child->name, (const xmlChar *)Trait::tag)) {
+                typename Trait::PtrElement element;
+                status_t status = Trait::deserialize(doc, child, element, serializingContext);
+                if (status != NO_ERROR) {
+                    return status;
+                }
+                if (collection.add(element) < 0) {
+                    ALOGE("%s: could not add element to %s collection", __FUNCTION__,
+                          Trait::collectionTag);
+                }
+            }
+            child = child->next;
+        }
+        if (!xmlStrcmp(root->name, (const xmlChar *)Trait::tag)) {
+            return NO_ERROR;
+        }
+        root = root->next;
+    }
+    return NO_ERROR;
+}
+```
+
+* 查找ModuleTraits::collectionTag = "modules"子节点,之后循环ModuleTraits::tag = "module"节点,调用ModuleTraits::deserialize
+```
+const char *const ModuleTraits::tag = "module";
+const char *const ModuleTraits::collectionTag = "modules";
+const char ModuleTraits::Attributes::name[] = "name";
+const char ModuleTraits::Attributes::version[] = "halVersion";
+```
+ModuleTraits::deserialize获取name和version属性
+创建module对象, 解析mixPorts,devicePorts,routes集合
+```
+    <modules>
+        <!-- Primary Audio HAL -->
+        <module name="primary" halVersion="3.0">
+
+```
+```
+status_t ModuleTraits::deserialize(xmlDocPtr doc, const xmlNode *root, PtrElement &module,
+                                   PtrSerializingCtx ctx)
+{
+    string name = getXmlAttribute(root, Attributes::name); // 获取xml module节点name属性值(例:name=primary)
+    if (name.empty()) {
+        ALOGE("%s: No %s found", __FUNCTION__, Attributes::name);
+        return BAD_VALUE;
+    }
+    uint32_t versionMajor = 0, versionMinor = 0;
+    string versionLiteral = getXmlAttribute(root, Attributes::version); //获取xml module节点halVersion属性值(例:halVersion=3.0)
+    if (!versionLiteral.empty()) {
+        sscanf(versionLiteral.c_str(), "%u.%u", &versionMajor, &versionMinor);
+        ALOGV("%s: mHalVersion = major %u minor %u",  __FUNCTION__,
+              versionMajor, versionMajor);
+    }
+
+    ALOGV("%s: %s %s=%s", __FUNCTION__, tag, Attributes::name, name.c_str());
+
+    module = new Element(name.c_str(), versionMajor, versionMinor); // 创建HwModule 对象(name=primary versionMajor=3 versionMinor=0)
+
+    // Deserialize childrens: Audio Mix Port, Audio Device Ports (Source/Sink), Audio Routes
+    MixPortTraits::Collection mixPorts; //模板函数解析MixPorts对象集合
+    deserializeCollection<MixPortTraits>(doc, root, mixPorts, NULL);
+    module->setProfiles(mixPorts);
+
+    DevicePortTraits::Collection devicePorts; ///模板函数解析devicePorts对象集合
+    deserializeCollection<DevicePortTraits>(doc, root, devicePorts, NULL);
+    module->setDeclaredDevices(devicePorts);
+
+    RouteTraits::Collection routes; //模板函数解析routes对象集合
+    deserializeCollection<RouteTraits>(doc, root, routes, module.get());
+    module->setRoutes(routes);
+
+    const xmlNode *children = root->xmlChildrenNode;
+    while (children != NULL) {
+        if (!xmlStrcmp(children->name, (const xmlChar *)childAttachedDevicesTag)) {
+            ALOGV("%s: %s %s found", __FUNCTION__, tag, childAttachedDevicesTag);
+            const xmlNode *child = children->xmlChildrenNode;
+            while (child != NULL) {
+                if (!xmlStrcmp(child->name, (const xmlChar *)childAttachedDeviceTag)) {
+                    xmlChar *attachedDevice = xmlNodeListGetString(doc, child->xmlChildrenNode, 1);
+                    if (attachedDevice != NULL) {
+                        ALOGV("%s: %s %s=%s", __FUNCTION__, tag, childAttachedDeviceTag,
+                              (const char*)attachedDevice);
+                        sp<DeviceDescriptor> device =
+                                module->getDeclaredDevices().getDeviceFromTagName(String8((const char*)attachedDevice));
+                        ctx->addAvailableDevice(device);
+                        xmlFree(attachedDevice);
+                    }
+                }
+                child = child->next;
+            }
+        }
+        if (!xmlStrcmp(children->name, (const xmlChar *)childDefaultOutputDeviceTag)) {
+            xmlChar *defaultOutputDevice = xmlNodeListGetString(doc, children->xmlChildrenNode, 1);;
+            if (defaultOutputDevice != NULL) {
+                ALOGV("%s: %s %s=%s", __FUNCTION__, tag, childDefaultOutputDeviceTag,
+                      (const char*)defaultOutputDevice);
+                sp<DeviceDescriptor> device =
+                        module->getDeclaredDevices().getDeviceFromTagName(String8((const char*)defaultOutputDevice));
+                if (device != 0 && ctx->getDefaultOutputDevice() == 0) {
+                    ctx->setDefaultOutputDevice(device);
+                    ALOGV("%s: default is %08x", __FUNCTION__, ctx->getDefaultOutputDevice()->type());
+                }
+                xmlFree(defaultOutputDevice);
+            }
+        }
+        children = children->next;
+    }
+    return NO_ERROR;
+}
+```
+
+* MixPort解析,利用模板函数调用最终MixPortTraits:: deserialize
+1. 获取节点name属性值(primary output)
+2. 获取节点role属性值(source)
+3. 创建IOProfile对象, 参数节点name, role
+4. 解析AudioProfiles
+5. 获取节点flags属性值
+6. 解析AudioGainTraits
+```
+            <mixPorts>
+                <mixPort name="primary output" role="source" flags="AUDIO_OUTPUT_FLAG_PRIMARY">
+                    <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
+                             samplingRates="48000" channelMasks="AUDIO_CHANNEL_OUT_STEREO"/>
+                </mixPort>
+```
+```
+const char *const MixPortTraits::collectionTag = "mixPorts";
+const char *const MixPortTraits::tag = "mixPort";
+```
+```
+    MixPortTraits::Collection mixPorts; //模板函数解析MixPorts对象集合
+    deserializeCollection<MixPortTraits>(doc, root, mixPorts, NULL);
+    module->setProfiles(mixPorts);
+```
+```
+status_t MixPortTraits::deserialize(_xmlDoc *doc, const _xmlNode *child, PtrElement &mixPort,
+                                    PtrSerializingCtx /*serializingContext*/)
+{
+    string name = getXmlAttribute(child, Attributes::name); //获取mixport节点name属性值(例:primary output)
+    if (name.empty()) {
+        ALOGE("%s: No %s found", __FUNCTION__, Attributes::name);
+        return BAD_VALUE;
+    }
+    ALOGV("%s: %s %s=%s", __FUNCTION__, tag, Attributes::name, name.c_str());
+    string role = getXmlAttribute(child, Attributes::role); //获取MixPort节点role属性值(例:source)
+    if (role.empty()) {
+        ALOGE("%s: No %s found", __FUNCTION__, Attributes::role);
+        return BAD_VALUE;
+    }
+    ALOGV("%s: Role=%s", __FUNCTION__, role.c_str());
+    audio_port_role_t portRole = role == "source" ? AUDIO_PORT_ROLE_SOURCE : AUDIO_PORT_ROLE_SINK;
+
+    mixPort = new Element(String8(name.c_str()), portRole); //创建IOProfile对象.
+
+    AudioProfileTraits::Collection profiles; //解析AudioProfile对象集合
+    deserializeCollection<AudioProfileTraits>(doc, child, profiles, NULL);
+    if (profiles.isEmpty()) {
+        sp <AudioProfile> dynamicProfile = new AudioProfile(gDynamicFormat,
+                                                            ChannelsVector(), SampleRateVector());
+        dynamicProfile->setDynamicFormat(true);
+        dynamicProfile->setDynamicChannels(true);
+        dynamicProfile->setDynamicRate(true);
+        profiles.add(dynamicProfile);
+    }
+    mixPort->setAudioProfiles(profiles);
+
+    string flags = getXmlAttribute(child, Attributes::flags);
+    if (!flags.empty()) {
+        // Source role
+        if (portRole == AUDIO_PORT_ROLE_SOURCE) {
+            mixPort->setFlags(OutputFlagConverter::maskFromString(flags));
+        } else {
+            // Sink role
+            mixPort->setFlags(InputFlagConverter::maskFromString(flags));
+        }
+    }
+    string maxOpenCount = getXmlAttribute(child, Attributes::maxOpenCount);
+    if (!maxOpenCount.empty()) {
+        convertTo(maxOpenCount, mixPort->maxOpenCount);
+    }
+    string maxActiveCount = getXmlAttribute(child, Attributes::maxActiveCount);
+    if (!maxActiveCount.empty()) {
+        convertTo(maxActiveCount, mixPort->maxActiveCount);
+    }
+    // Deserialize children
+    AudioGainTraits::Collection gains;
+    deserializeCollection<AudioGainTraits>(doc, child, gains, NULL);
+    mixPort->setGains(gains);
+
+    return NO_ERROR;
+}
+```
+
+* 解析AudioProfiles ,获取format, samplingRates, channelMasks属性值
+创建AudioProfile对象
+```
+const char *const AudioProfileTraits::collectionTag = "profiles";
+const char *const AudioProfileTraits::tag = "profile";
+
+const char AudioProfileTraits::Attributes::name[] = "name";
+const char AudioProfileTraits::Attributes::samplingRates[] = "samplingRates";
+const char AudioProfileTraits::Attributes::format[] = "format";
+const char AudioProfileTraits::Attributes::channelMasks[] = "channelMasks";
+
+status_t AudioProfileTraits::deserialize(_xmlDoc */*doc*/, const _xmlNode *root, PtrElement &profile,
+                                         PtrSerializingCtx /*serializingContext*/)
+{
+    string samplingRates = getXmlAttribute(root, Attributes::samplingRates);
+    string format = getXmlAttribute(root, Attributes::format);
+    string channels = getXmlAttribute(root, Attributes::channelMasks);
+
+    profile = new Element(formatFromString(format, gDynamicFormat),
+                          channelMasksFromString(channels, ","),
+                          samplingRatesFromString(samplingRates, ","));
+
+    profile->setDynamicFormat(profile->getFormat() == gDynamicFormat);
+    profile->setDynamicChannels(profile->getChannels().isEmpty());
+    profile->setDynamicRate(profile->getSampleRates().isEmpty());
+
+    return NO_ERROR;
+}
+```
+
+* 解析devicePorts
+获取tagName属性值
+获取type属性值
+获取role属性值
+创建DeviceDescriptor对象, 参数(type, name)
+获取address属性值
+解析AudioProfiles对象集合
+解析AudioGains对象集合
+
+```
+    DevicePortTraits::Collection devicePorts; ///模板函数解析devicePorts对象集合
+    deserializeCollection<DevicePortTraits>(doc, root, devicePorts, NULL);
+    module->setDeclaredDevices(devicePorts);
+```
+```
+            <devicePorts>
+                <!-- Output devices declaration, i.e. Sink DEVICE PORT -->
+                <devicePort tagName="Earpiece" type="AUDIO_DEVICE_OUT_EARPIECE" role="sink">
+                   <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
+                            samplingRates="48000" channelMasks="AUDIO_CHANNEL_IN_MONO"/>
+                </devicePort>
+                <devicePort tagName="Speaker" role="sink" type="AUDIO_DEVICE_OUT_SPEAKER" address="">
+                    <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
+                             samplingRates="48000" channelMasks="AUDIO_CHANNEL_OUT_STEREO"/>
+                    <gains>
+                        <gain name="gain_1" mode="AUDIO_GAIN_MODE_JOINT"
+                              minValueMB="-8400"
+                              maxValueMB="4000"
+                              defaultValueMB="0"
+                              stepValueMB="100"/>
+                    </gains>
+                </devicePort>
+```
+```
+const char *const DevicePortTraits::tag = "devicePort";
+const char *const DevicePortTraits::collectionTag = "devicePorts";
+
+const char DevicePortTraits::Attributes::tagName[] = "tagName";
+const char DevicePortTraits::Attributes::type[] = "type";
+const char DevicePortTraits::Attributes::role[] = "role";
+const char DevicePortTraits::Attributes::address[] = "address";
+const char DevicePortTraits::Attributes::roleSource[] = "source";
+
+status_t DevicePortTraits::deserialize(_xmlDoc *doc, const _xmlNode *root, PtrElement &deviceDesc,
+                                       PtrSerializingCtx /*serializingContext*/)
+{
+    string name = getXmlAttribute(root, Attributes::tagName); //获取tagName属性值
+    if (name.empty()) {
+        ALOGE("%s: No %s found", __FUNCTION__, Attributes::tagName);
+        return BAD_VALUE;
+    }
+    ALOGV("%s: %s %s=%s", __FUNCTION__, tag, Attributes::tagName, name.c_str());
+    string typeName = getXmlAttribute(root, Attributes::type); //获取type属性值
+    if (typeName.empty()) {
+        ALOGE("%s: no type for %s", __FUNCTION__, name.c_str());
+        return BAD_VALUE;
+    }
+    ALOGV("%s: %s %s=%s", __FUNCTION__, tag, Attributes::type, typeName.c_str());
+    string role = getXmlAttribute(root, Attributes::role); //获取role属性值
+    if (role.empty()) {
+        ALOGE("%s: No %s found", __FUNCTION__, Attributes::role);
+        return BAD_VALUE;
+    }
+    ALOGV("%s: %s %s=%s", __FUNCTION__, tag, Attributes::role, role.c_str());
+    audio_port_role_t portRole = (role == Attributes::roleSource) ?
+                AUDIO_PORT_ROLE_SOURCE : AUDIO_PORT_ROLE_SINK;
+
+    audio_devices_t type = AUDIO_DEVICE_NONE;
+    if (!deviceFromString(typeName, type) ||
+            (!audio_is_input_device(type) && portRole == AUDIO_PORT_ROLE_SOURCE) ||
+            (!audio_is_output_devices(type) && portRole == AUDIO_PORT_ROLE_SINK)) {
+        ALOGW("%s: bad type %08x", __FUNCTION__, type);
+        return BAD_VALUE;
+    }
+    deviceDesc = new Element(type, String8(name.c_str()));
+
+    string address = getXmlAttribute(root, Attributes::address); //获取address属性值
+    if (!address.empty()) {
+        ALOGV("%s: address=%s for %s", __FUNCTION__, address.c_str(), name.c_str());
+        deviceDesc->mAddress = String8(address.c_str());
+    }
+
+    AudioProfileTraits::Collection profiles;
+    deserializeCollection<AudioProfileTraits>(doc, root, profiles, NULL);
+    if (profiles.isEmpty()) {
+        sp <AudioProfile> dynamicProfile = new AudioProfile(gDynamicFormat,
+                                                            ChannelsVector(), SampleRateVector());
+        dynamicProfile->setDynamicFormat(true);
+        dynamicProfile->setDynamicChannels(true);
+        dynamicProfile->setDynamicRate(true);
+        profiles.add(dynamicProfile);
+    }
+    deviceDesc->setAudioProfiles(profiles);
+
+    // Deserialize AudioGain children
+    deserializeCollection<AudioGainTraits>(doc, root, deviceDesc->mGains, NULL);
+    ALOGV("%s: adding device tag %s type %08x address %s", __FUNCTION__,
+          deviceDesc->getName().string(), type, deviceDesc->mAddress.string());
+    return NO_ERROR;
+}
+```
+
+* 解析routes
+获取type属性值(例: mix)
+创建AudioRoute对象(AUDIO_ROUTE_MIX)
+获取sink属性值(例: Speaker)
+通过sink的值在AudioPolicyConfig中查找对应AudioPort对象(对应devicePort节点解析)
+设置AudioRoute对象msink = 查找的AudioPort对象
+获取sources属性值(例: primary output,deep_buffer,BT SCO Headset Mic)
+通过sources属性值在AudioPolicyConfig中查找对应AudioPort对象(对应MixPort节点解析)
+AudioRoute对象加入到sink对象AudioPort中
+AudioRoute对象加入的source对象AudioPort中
+source对象加入到AudioRoute的mSources中
+
+```
+            <routes>
+                <route type="mix" sink="Earpiece"
+                       sources="primary output,deep_buffer,BT SCO Headset Mic"/>
+                <route type="mix" sink="Speaker"
+                       sources="primary output,deep_buffer,compressed_offload,BT SCO Headset Mic,Telephony Rx"/>
+                <route type="mix" sink="Wired Headset"
+                       sources="primary output,deep_buffer,compressed_offload,BT SCO Headset Mic,Telephony Rx"/>
+                <route type="mix" sink="Wired Headphones"
+                       sources="primary output,deep_buffer,compressed_offload,BT SCO Headset Mic,Telephony Rx"/>
+                <route type="mix" sink="Telephony Tx"
+                       sources="voice_tx"/>
+                <route type="mix" sink="primary input"
+                       sources="Built-In Mic,Built-In Back Mic,Wired Headset Mic,BT SCO Headset Mic"/>
+                <route type="mix" sink="Telephony Tx"
+                       sources="Built-In Mic,Built-In Back Mic,Wired Headset Mic,BT SCO Headset Mic"/>
+                <route type="mix" sink="voice_rx"
+                       sources="Telephony Rx"/>
+            </routes>
+```
+```
+const char *const RouteTraits::tag = "route";
+const char *const RouteTraits::collectionTag = "routes";
+
+const char RouteTraits::Attributes::type[] = "type";
+const char RouteTraits::Attributes::typeMix[] = "mix";
+const char RouteTraits::Attributes::sink[] = "sink";
+const char RouteTraits::Attributes::sources[] = "sources";
+
+status_t RouteTraits::deserialize(_xmlDoc */*doc*/, const _xmlNode *root, PtrElement &element,
+                                  PtrSerializingCtx ctx)
+{
+    string type = getXmlAttribute(root, Attributes::type); //获取type属性值
+    if (type.empty()) {
+        ALOGE("%s: No %s found", __FUNCTION__, Attributes::type);
+        return BAD_VALUE;
+    }
+    audio_route_type_t routeType = (type == Attributes::typeMix) ?
+                AUDIO_ROUTE_MIX : AUDIO_ROUTE_MUX;
+
+    ALOGV("%s: %s %s=%s", __FUNCTION__, tag, Attributes::type, type.c_str());
+    element = new Element(routeType); //创建AudioRoute对象,type参数
+
+    string sinkAttr = getXmlAttribute(root, Attributes::sink); //获取sink属性值
+    if (sinkAttr.empty()) {
+        ALOGE("%s: No %s found", __FUNCTION__, Attributes::sink);
+        return BAD_VALUE;
+    }
+    // Convert Sink name to port pointer
+    sp<AudioPort> sink = ctx->findPortByTagName(String8(sinkAttr.c_str())); //通过sink在AudioPolicyConfig中查找对应AudioPort对象
+    if (sink == NULL) {
+        ALOGE("%s: no sink found with name=%s", __FUNCTION__, sinkAttr.c_str());
+        return BAD_VALUE;
+    }
+    element->setSink(sink);
+
+    string sourcesAttr = getXmlAttribute(root, Attributes::sources); //获取sources属性值
+    if (sourcesAttr.empty()) {
+        ALOGE("%s: No %s found", __FUNCTION__, Attributes::sources);
+        return BAD_VALUE;
+    }
+    // Tokenize and Convert Sources name to port pointer
+    AudioPortVector sources;
+    char *sourcesLiteral = strndup(sourcesAttr.c_str(), strlen(sourcesAttr.c_str()));
+    char *devTag = strtok(sourcesLiteral, ",");
+    while (devTag != NULL) {
+        if (strlen(devTag) != 0) {
+            sp<AudioPort> source = ctx->findPortByTagName(String8(devTag)); //将AudioPolicyConfig中的AudioPort对象加入sources集合
+            if (source == NULL) {
+                ALOGE("%s: no source found with name=%s", __FUNCTION__, devTag);
+                free(sourcesLiteral);
+                return BAD_VALUE;
+            }
+            sources.add(source);
+        }
+        devTag = strtok(NULL, ",");
+    }
+    free(sourcesLiteral);
+
+    sink->addRoute(element); // AudioRoute对象加入sink AudioPort中
+    for (size_t i = 0; i < sources.size(); i++) {
+        sp<AudioPort> source = sources.itemAt(i);
+        source->addRoute(element); //AudioRoute对象加入sources AudioPort中
+    }
+    element->setSources(sources); //设置AudioRoute sources
+    return NO_ERROR;
+}
+```
+* 将attachedDevices 设置 AudioPolicyConfig mAvailableOutputDevices mAvailableInputDevices 可用输入输出设备集合
+* 将childDefaultOutputDevice 设置 AudioPolicyConfig::mDefaultOutputDevices 模式输出设备
+
+* modules解析完成
+* 之后解析VolumeTraits 音量曲线配置
+```
+    // deserialize volume section
+    VolumeTraits::Collection volumes;
+    deserializeCollection<VolumeTraits>(doc, cur, volumes, &config);
+    config.setVolumes(volumes);
+```
+
+* 之后解析  `  GlobalConfigTraits::deserialize(cur, config);`
+获取speaker_drc_enabled属性值, 设置AudioPolicyConfig::mIsSpeakerDrcEnabled
+```
+   <globalConfiguration speaker_drc_enabled="true"/>
+```
+```
+const char *const GlobalConfigTraits::tag = "globalConfiguration";
+
+const char GlobalConfigTraits::Attributes::speakerDrcEnabled[] = "speaker_drc_enabled";
+
+
+status_t GlobalConfigTraits::deserialize(const xmlNode *cur, AudioPolicyConfig &config)
+{
+    const xmlNode *root = cur->xmlChildrenNode;
+    while (root != NULL) {
+        if (!xmlStrcmp(root->name, (const xmlChar *)tag)) {
+            string speakerDrcEnabled =
+                    getXmlAttribute(root, Attributes::speakerDrcEnabled);
+            bool isSpeakerDrcEnabled;
+            if (!speakerDrcEnabled.empty() &&
+                    convertTo<string, bool>(speakerDrcEnabled, isSpeakerDrcEnabled)) {
+                config.setSpeakerDrcEnabled(isSpeakerDrcEnabled);
+            }
+            return NO_ERROR;
+        }
+        root = root->next;
+    }
+    return NO_ERROR;
+}
+```
+
+## xml文件对应代码结构注释
+```
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!-- Copyright (C) 2015 The Android Open Source Project
+
+     Licensed under the Apache License, Version 2.0 (the "License");
+     you may not use this file except in compliance with the License.
+     You may obtain a copy of the License at
+
+          http://www.apache.org/licenses/LICENSE-2.0
+
+     Unless required by applicable law or agreed to in writing, software
+     distributed under the License is distributed on an "AS IS" BASIS,
+     WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+     See the License for the specific language governing permissions and
+     limitations under the License.
+-->
+
+<!-- Serializer.cpp构造函数 
+    mRootElementName=audioPolicyConfiguration
+    mVersion=1.0
+    deserialize(const char *configFile, AudioPolicyConfig &config) 参数文件名, AudioPolicyConfig类
+
+    函数中判断 节点名和version 是否匹配
+    解析xml填充AudioPolicyConfig结构属性
+    AudioPolicyConfig {
+        private:
+        HwModuleCollection &mHwModules; /**< Collection of Module, with Profiles, i.e. Mix Ports. */
+        DeviceVector &mAvailableOutputDevices;
+        DeviceVector &mAvailableInputDevices;
+        sp<DeviceDescriptor> &mDefaultOutputDevices;
+        VolumeCurvesCollection *mVolumeCurves;
+        // TODO: remove when legacy conf file is removed. true on devices that use DRC on the
+        // DEVICE_CATEGORY_SPEAKER path to boost soft sounds, used to adjust volume curves accordingly.
+        // Note: remove also speaker_drc_enabled from global configuration of XML config file.
+        bool mIsSpeakerDrcEnabled;
+    }; -->
+<audioPolicyConfiguration version="1.0" xmlns:xi="http://www.w3.org/2001/XInclude">
+    <!-- version section contains a “version” tag in the form “major.minor” e.g version=”1.0” -->
+
+    <!-- Global configuration Decalaration -->
+    <globalConfiguration speaker_drc_enabled="true"/>
+    <!-- 设置 AudioPlicyConfig::mIsSpeakerDrcEnabled = true -->
+
+
+    <!-- Modules section:
+        There is one section per audio HW module present on the platform.
+        Each module section will contains two mandatory tags for audio HAL “halVersion” and “name”.
+        The module names are the same as in current .conf file:
+                “primary”, “A2DP”, “remote_submix”, “USB”
+        Each module will contain the following sections:
+        “devicePorts”: a list of device descriptors for all input and output devices accessible via this
+        module.
+        This contains both permanently attached devices and removable devices.
+        “mixPorts”: listing all output and input streams exposed by the audio HAL
+        “routes”: list of possible connections between input and output devices or between stream and
+        devices.
+            "route": is defined by an attribute:
+                -"type": <mux|mix> means all sources are mutual exclusive (mux) or can be mixed (mix)
+                -"sink": the sink involved in this route
+                -"sources": all the sources than can be connected to the sink via vis route
+        “attachedDevices”: permanently attached devices.
+        The attachedDevices section is a list of devices names. The names correspond to device names
+        defined in <devicePorts> section.
+        “defaultOutputDevice”: device to be used by default when no policy rule applies
+    -->
+    <!-- modules填充 AudioPolicyConfig::mHwModules -->
+    <modules>
+        <!-- Primary Audio HAL -->
+        <!-- module 对应模块填充 
+        HwModule {
+            private:
+            const String8 mName; // base name of the audio HW module (primary, a2dp ...)
+            audio_module_handle_t mHandle;
+            OutputProfileCollection mOutputProfiles; // output profiles exposed by this module
+            InputProfileCollection mInputProfiles;  // input profiles exposed by this module
+            uint32_t mHalVersion; // audio HAL API version
+            DeviceVector mDeclaredDevices; // devices declared in audio_policy configuration file.
+            AudioRouteVector mRoutes;
+            AudioPortVector mPorts;
+        };-->
+        <!-- HwModule::mName=primary HwModule::mHalVersion==3.0-->
+        <module name="primary" halVersion="3.0">
+            <!--
+                设置 
+                AudioPolicyConfig::mAvailableOutputDevices 
+                AudioPolicyConfig::mAvailableInputDevices
+             -->
+            <attachedDevices>
+                <item>Speaker</item>
+                <item>Built-In Mic</item>
+                <item>Built-In Back Mic</item>
+            </attachedDevices>
+            <!--DeviceDescriptor 
+                / * 模块定义支持的设备描述向量  DeviceVector mDeclaredDevices; */
+                module->getDeclaredDevices().getDeviceFromTagName(String8((const char*)attachedDevice));
+                AudioPolicyConfig::mDefaultOutputDevices=Speaker-->
+            <defaultOutputDevice>Speaker</defaultOutputDevice>
+            <!--
+                struct MixPortTraits
+                {
+                    static const char *const tag; // "mixPort"
+                    static const char *const collectionTag; // "mixPorts"
+
+                    struct Attributes //MixPort节点对应属性
+                    {
+                        static const char name[];
+                        static const char role[]; // role == "source" ? AUDIO_PORT_ROLE_SOURCE : AUDIO_PORT_ROLE_SINK;
+                        static const char flags[];
+                        static const char maxOpenCount[]; //
+                        static const char maxActiveCount[]; //
+                    };
+
+                typedef IOProfile Element;
+                typedef sp<Element> PtrElement; //IOProfile对象
+                typedef IOProfileCollection Collection;
+                typedef void *PtrSerializingCtx; //指向AudioPolicyConfig对象
+
+                static status_t deserialize(_xmlDoc *doc, const _xmlNode *root, PtrElement &element,
+                                PtrSerializingCtx serializingContext);
+            };
+
+            -->
+            <mixPorts>
+                <!--
+                    new IOProfile(name, role) : AudioPort(name, AUDIO_PORT_TYPE_MIX, role),
+                                maxOpenCount((role == AUDIO_PORT_ROLE_SOURCE) ? 1 : 0),
+                                curOpenCount(0),
+                                maxActiveCount(1),
+                                curActiveCount(0) {}
+
+                    //设置 IOProfile::AudioPort::mProfiles
+                    mixPort->setAudioProfiles(profiles);
+                    //设置 IOProfile::AudioPort::mFlags
+                    //设置 IOProfile::AudioPort::mGains
+                -->
+                <mixPort name="primary output" role="source" flags="AUDIO_OUTPUT_FLAG_PRIMARY">
+                    <!--
+                        struct AudioProfileTraits
+                        {
+                            static const char *const tag; //"profile"
+                            static const char *const collectionTag; //"profiles"
+
+                            struct Attributes
+                            {
+                                static const char name[]; 
+                                static const char samplingRates[];
+                                static const char format[];
+                                static const char channelMasks[];
+                            };
+
+                            typedef AudioProfile Element;
+                            typedef sp<AudioProfile> PtrElement;
+                            typedef AudioProfileVector Collection;
+                            typedef void *PtrSerializingCtx;
+
+                            static status_t deserialize(_xmlDoc *doc, const _xmlNode *root, PtrElement &element,
+                                                        PtrSerializingCtx serializingContext);
+                        };
+
+                    -->
+                    <!-- 
+                        class AudioProfile : public virtual RefBase
+                        {
+                            private:
+                            String8  mName; // name = "";
+                            audio_format_t mFormat; // format = "AUDIO_FORMAT_PCM_16_BIT";
+                            ChannelsVector mChannelMasks; // channelMasks = "AUDIO_CHANNEL_OUT_STEREO"
+                            SampleRateVector mSamplingRates; // samplingRates = "48000"
+
+                            bool mIsDynamicFormat = false;
+                            bool mIsDynamicChannels = false;
+                            bool mIsDynamicRate = false;
+                        };
+                    -->
+                    <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
+                             samplingRates="48000" channelMasks="AUDIO_CHANNEL_OUT_STEREO"/>
+                </mixPort>
+                <mixPort name="deep_buffer" role="source"
+                        flags="AUDIO_OUTPUT_FLAG_DEEP_BUFFER">
+                    <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
+                             samplingRates="48000" channelMasks="AUDIO_CHANNEL_OUT_STEREO"/>
+                </mixPort>
+                <mixPort name="compressed_offload" role="source"
+                         flags="AUDIO_OUTPUT_FLAG_DIRECT|AUDIO_OUTPUT_FLAG_COMPRESS_OFFLOAD|AUDIO_OUTPUT_FLAG_NON_BLOCKING">
+                    <profile name="" format="AUDIO_FORMAT_MP3"
+                             samplingRates="8000,11025,12000,16000,22050,24000,32000,44100,48000"
+                             channelMasks="AUDIO_CHANNEL_OUT_STEREO,AUDIO_CHANNEL_OUT_MONO"/>
+                    <profile name="" format="AUDIO_FORMAT_AAC"
+                             samplingRates="8000,11025,12000,16000,22050,24000,32000,44100,48000"
+                             channelMasks="AUDIO_CHANNEL_OUT_STEREO,AUDIO_CHANNEL_OUT_MONO"/>
+                    <profile name="" format="AUDIO_FORMAT_AAC_LC"
+                             samplingRates="8000,11025,12000,16000,22050,24000,32000,44100,48000"
+                             channelMasks="AUDIO_CHANNEL_OUT_STEREO,AUDIO_CHANNEL_OUT_MONO"/>
+                </mixPort>
+                <mixPort name="voice_tx" role="source">
+                    <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
+                             samplingRates="8000,16000" channelMasks="AUDIO_CHANNEL_OUT_MONO"/>
+                </mixPort>
+                <mixPort name="primary input" role="sink">
+                    <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
+                             samplingRates="8000,11025,12000,16000,22050,24000,32000,44100,48000"
+                             channelMasks="AUDIO_CHANNEL_IN_MONO,AUDIO_CHANNEL_IN_STEREO,AUDIO_CHANNEL_IN_FRONT_BACK"/>
+                </mixPort>
+                <mixPort name="voice_rx" role="sink">
+                    <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
+                             samplingRates="8000,16000" channelMasks="AUDIO_CHANNEL_IN_MONO"/>
+                </mixPort>
+            </mixPorts>
+            <!-- 
+                struct DevicePortTraits
+                {
+                    static const char *const tag; // "devicePort"
+                    static const char *const collectionTag; // "devicePorts"
+
+                    struct Attributes
+                    {
+                        static const char tagName[]; /**<  <device tag name>: any string without space. */
+                        static const char type[]; /**< <device type>. */
+                        static const char role[]; /**< <device role: sink or source>. */
+                        static const char roleSource[]; /**< <attribute role source value>. */
+                        static const char address[]; /**< optional: device address, char string less than 64. */
+                    };
+                    typedef DeviceDescriptor Element;
+                    typedef sp<DeviceDescriptor> PtrElement;
+                    typedef DeviceVector Collection;
+                    typedef void *PtrSerializingCtx;
+
+                    static status_t deserialize(_xmlDoc *doc, const _xmlNode *root, PtrElement &element,
+                                                PtrSerializingCtx serializingContext);
+                    // Children are: GainTraits (optionnal)
+                };
+            -->
+            <devicePorts>
+                <!-- Output devices declaration, i.e. Sink DEVICE PORT -->
+                <!-- 
+                    class DeviceDescriptor : public AudioPort, public AudioPortConfig 
+                    {
+    
+                    }
+
+                    new DeviceDescriptor(type, name)
+                    AudioPort(String8(""), AUDIO_PORT_TYPE_DEVICE,
+                    audio_is_output_device(type) ? AUDIO_PORT_ROLE_SINK : AUDIO_PORT_ROLE_SOURCE),
+                    mAddress(""), mTagName(tagName), mDeviceType(type), mId(0)
+                    {
+                        if (type == AUDIO_DEVICE_IN_REMOTE_SUBMIX || type == AUDIO_DEVICE_OUT_REMOTE_SUBMIX ) {
+                            mAddress = String8("0");
+                        }
+                    }
+
+                    设置设备描述符mProfiles
+                    DeviceDescriptor::AudioPort::mProfiles
+                    设置AudioGains
+                -->
+                <devicePort tagName="Earpiece" type="AUDIO_DEVICE_OUT_EARPIECE" role="sink">
+                    <!--
+                        class AudioProfile : public virtual RefBase
+                        {
+                            private:
+                            String8  mName; // name = "";
+                            audio_format_t mFormat; // format = "AUDIO_FORMAT_PCM_16_BIT";
+                            ChannelsVector mChannelMasks; // channelMasks = "AUDIO_CHANNEL_IN_MONO"
+                            SampleRateVector mSamplingRates; // samplingRates = "48000"
+
+                            bool mIsDynamicFormat = false;
+                            bool mIsDynamicChannels = false;
+                            bool mIsDynamicRate = false;
+                        };                 
+                    -->
+                   <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
+                            samplingRates="48000" channelMasks="AUDIO_CHANNEL_IN_MONO"/>
+                </devicePort>
+                <devicePort tagName="Speaker" role="sink" type="AUDIO_DEVICE_OUT_SPEAKER" address="">
+                    <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
+                             samplingRates="48000" channelMasks="AUDIO_CHANNEL_OUT_STEREO"/>
+                    <gains>
+                        <gain name="gain_1" mode="AUDIO_GAIN_MODE_JOINT"
+                              minValueMB="-8400"
+                              maxValueMB="4000"
+                              defaultValueMB="0"
+                              stepValueMB="100"/>
+                    </gains>
+                </devicePort>
+                <devicePort tagName="Wired Headset" type="AUDIO_DEVICE_OUT_WIRED_HEADSET" role="sink">
+                    <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
+                             samplingRates="48000" channelMasks="AUDIO_CHANNEL_OUT_STEREO"/>
+                </devicePort>
+                <devicePort tagName="Wired Headphones" type="AUDIO_DEVICE_OUT_WIRED_HEADPHONE" role="sink">
+                    <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
+                             samplingRates="48000" channelMasks="AUDIO_CHANNEL_OUT_STEREO"/>
+                </devicePort>
+                <devicePort tagName="BT SCO" type="AUDIO_DEVICE_OUT_BLUETOOTH_SCO" role="sink">
+                    <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
+                             samplingRates="8000,16000" channelMasks="AUDIO_CHANNEL_OUT_MONO"/>
+                </devicePort>
+                <devicePort tagName="BT SCO Headset" type="AUDIO_DEVICE_OUT_BLUETOOTH_SCO_HEADSET" role="sink">
+                    <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
+                             samplingRates="8000,16000" channelMasks="AUDIO_CHANNEL_OUT_MONO"/>
+                </devicePort>
+                <devicePort tagName="BT SCO Car Kit" type="AUDIO_DEVICE_OUT_BLUETOOTH_SCO_CARKIT" role="sink">
+                    <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
+                             samplingRates="8000,16000" channelMasks="AUDIO_CHANNEL_OUT_MONO"/>
+                </devicePort>
+                <devicePort tagName="Telephony Tx" type="AUDIO_DEVICE_OUT_TELEPHONY_TX" role="sink">
+                    <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
+                             samplingRates="8000,16000" channelMasks="AUDIO_CHANNEL_OUT_MONO"/>
+                </devicePort>
+
+                <devicePort tagName="Built-In Mic" type="AUDIO_DEVICE_IN_BUILTIN_MIC" role="source">
+                    <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
+                             samplingRates="8000,11025,12000,16000,22050,24000,32000,44100,48000"
+                             channelMasks="AUDIO_CHANNEL_IN_MONO,AUDIO_CHANNEL_IN_STEREO,AUDIO_CHANNEL_IN_FRONT_BACK"/>
+                </devicePort>
+                <devicePort tagName="Built-In Back Mic" type="AUDIO_DEVICE_IN_BACK_MIC" role="source">
+                    <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
+                             samplingRates="8000,11025,12000,16000,22050,24000,32000,44100,48000"
+                             channelMasks="AUDIO_CHANNEL_IN_MONO,AUDIO_CHANNEL_IN_STEREO,AUDIO_CHANNEL_IN_FRONT_BACK"/>
+                </devicePort>
+                <devicePort tagName="Wired Headset Mic" type="AUDIO_DEVICE_IN_WIRED_HEADSET" role="source">
+                    <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
+                             samplingRates="8000,11025,12000,16000,22050,24000,32000,44100,48000"
+                             channelMasks="AUDIO_CHANNEL_IN_MONO,AUDIO_CHANNEL_IN_STEREO,AUDIO_CHANNEL_IN_FRONT_BACK"/>
+                </devicePort>
+                <devicePort tagName="BT SCO Headset Mic" type="AUDIO_DEVICE_IN_BLUETOOTH_SCO_HEADSET" role="source">
+                    <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
+                             samplingRates="8000,16000" channelMasks="AUDIO_CHANNEL_IN_MONO"/>
+                </devicePort>
+                <devicePort tagName="Telephony Rx" type="AUDIO_DEVICE_IN_TELEPHONY_RX" role="source">
+                    <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
+                             samplingRates="8000,16000" channelMasks="AUDIO_CHANNEL_IN_MONO"/>
+                </devicePort>
+            </devicePorts>
+            <!-- route declaration, i.e. list all available sources for a given sink -->
+            <!--
+                struct RouteTraits
+                {
+                    static const char *const tag; // "route"
+                    static const char *const collectionTag; // "routes"
+
+                    struct Attributes
+                    {
+                        static const char type[]; /**< <route type>: mix or mux. */
+                        static const char typeMix[]; /**< type attribute mix value. */
+                        static const char sink[]; /**< <sink: involved in this route>. */
+                        static const char sources[]; /**< sources: all source that can be involved in this route. */
+                    };
+                    typedef AudioRoute Element;
+                    typedef sp<AudioRoute> PtrElement;
+                    typedef AudioRouteVector Collection;
+                    typedef HwModule *PtrSerializingCtx;
+
+                    static status_t deserialize(_xmlDoc *doc, const _xmlNode *root, PtrElement &element,
+                                                PtrSerializingCtx ctx);
+                };
+            -->
+            <routes>
+                <!-- 
+                    class AudioRoute  : public virtual RefBase
+                    {
+                    private:
+                        AudioPortVector mSources;
+                        sp<AudioPort> mSink;
+                        audio_route_type_t mType;
+
+                    };
+                    new AudioRoute(type) : mType(type) {}
+                    AudioRoute::mSink == HwModule::findPortByTagName("Earpiece"); //匹配devicePort
+                    HwModule::mPorts::mRoutes.add(AudioRoute)
+
+                    AudioRoute::mSources.add(HwModule::findPortByTagName(primary output,deep_buffer,BT SCO Headset Mic")) //匹配MixPort
+                    HwModule::mPorts::mRoutes.add(AudioRoute)
+
+                -->
+                <route type="mix" sink="Earpiece"
+                       sources="primary output,deep_buffer,BT SCO Headset Mic"/>
+                <route type="mix" sink="Speaker"
+                       sources="primary output,deep_buffer,compressed_offload,BT SCO Headset Mic,Telephony Rx"/>
+                <route type="mix" sink="Wired Headset"
+                       sources="primary output,deep_buffer,compressed_offload,BT SCO Headset Mic,Telephony Rx"/>
+                <route type="mix" sink="Wired Headphones"
+                       sources="primary output,deep_buffer,compressed_offload,BT SCO Headset Mic,Telephony Rx"/>
+                <route type="mix" sink="primary input"
+                       sources="Built-In Mic,Built-In Back Mic,Wired Headset Mic,BT SCO Headset Mic"/>
+                <route type="mix" sink="Telephony Tx"
+                       sources="Built-In Mic,Built-In Back Mic,Wired Headset Mic,BT SCO Headset Mic, voice_tx"/>
+                <route type="mix" sink="voice_rx"
+                       sources="Telephony Rx"/>
+            </routes>
+
+        </module>
+
+        <!-- A2dp Audio HAL -->
+        <xi:include href="a2dp_audio_policy_configuration.xml"/>
+
+        <!-- Usb Audio HAL -->
+        <xi:include href="usb_audio_policy_configuration.xml"/>
+
+        <!-- Remote Submix Audio HAL -->
+        <xi:include href="r_submix_audio_policy_configuration.xml"/>
+
+        <!-- Hearing aid Audio HAL -->
+        <xi:include href="hearing_aid_audio_policy_configuration.xml"/>
+
+    </modules>
+    <!-- End of Modules section -->
+
+    <!-- Volume section -->
+
+    <xi:include href="audio_policy_volumes.xml"/>
+    <xi:include href="default_volume_tables.xml"/>
+
+    <!-- End of Volume section -->
+
+</audioPolicyConfiguration>
+
+```
