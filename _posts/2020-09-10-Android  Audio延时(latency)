@@ -1,6 +1,14 @@
-
-
-
+---
+layout:     post
+title:      Android Audio延时(latency)
+subtitle:   Android Audio延时(latency)
+date:       2020-09-10
+author:     Joey
+header-img: img/post-bg-debug.png
+catalog: true
+tags:
+    - Audio
+---
 
 ## Android Audio 延迟 (latency)
 
