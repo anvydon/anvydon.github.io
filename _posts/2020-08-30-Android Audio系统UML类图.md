@@ -11,4 +11,4 @@ tags:
 ---
 
 # Audio 系统UML类图
-![adfa](../img/AudioFlinger.png)
+![](../img/AudioFlinger.png)
