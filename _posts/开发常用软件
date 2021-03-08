@@ -1,0 +1,21 @@
+# 开发常用软件
+## draw.io
+draw.io 是一款开源免费的在线图表编辑工具, 可以用来编辑工作流, BPM, org charts, UML, ER图, 网络拓朴图等
+## xshell
+Xshell 是一个强大的安全终端模拟软件，它支持SSH1, SSH2, 以及Microsoft Windows 平台的TELNET 协议。个人用户免费使用。
+## xmind
+XMind是一款同样开源且跨平台的思维导图软件。
+## Source Insight
+Source Insight是一个面向项目开发的程序编辑器和代码浏览器，它拥有内置的对C/C++, C#和Java等程序的分析。收费软件，可试用30天。
+## Serial Port Utility
+友善串口调试助手，windows串口调试使用方便。
+## WinSCP
+WinSCP是一个Windows环境下使用SSH的开源图形化SFTP客户端。同时支持SCP协议。它的主要功能就是在本地与远程计算机间安全的复制文件。
+## Oracle VM VirtualBox
+VirtualBox 是一款开源虚拟机软件。
+## Notepad++
+Notepad++ 是在微软视窗环境之下的一个免费的代码编辑器。
+## Google Chrome
+Google Chrome是一款由Google公司开发的网页浏览器，该浏览器基于其他开源软件撰写。
+## markdown
+Markdown 编写的文档可以导出 HTML 、Word、图像、PDF、Epub 等多种格式的文档。
